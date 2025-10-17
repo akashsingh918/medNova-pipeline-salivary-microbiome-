@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-create_health_weights.py
-Derive evidence-weighted genus scores from a downloaded SalivaDB CSV.
+create_health_weights.py  (clean + provenance)
 
-Output: salivadb_genus_weights.csv with a 'HealthWeight' column in [-1, 1].
+Derive genus-level HealthWeight from SalivaDB export:
+  HealthWeight = (N_healthy - N_disease) / (N_healthy + N_disease)
+
+- Cleans biomarker names → genus; drops higher ranks and ambiguous abbreviations.
+- Applies --min_evidence threshold (default 3).
+- Emits:
+    salivadb_genus_weights.csv       (index=Genus, col=HealthWeight)
+    salivadb_genus_weights.meta.json (provenance)
 """
-import pandas as pd, numpy as np, os, re, argparse, json
+import argparse, os, re, json, pandas as pd
 from datetime import datetime
 
+REQ_COLS = {"Biomarker Name", "Regulation"}
 EXCLUDE_TAXA = {
     "Bacteria","Eubacteria","Proteobacteria","Firmicutes","Actinobacteria","Bacteroidetes",
     "Fusobacteria","Spirochaetes","Cyanobacteria","Tenericutes",
@@ -18,60 +25,64 @@ EXCLUDE_TAXA = {
 
 def clean_genus(name: str) -> str:
     s = str(name).replace("Candidatus ", "").strip()
-    s = re.sub(r"\[|\]|[a-z]__", "", s)
-    tokens = s.split()
-    if not tokens: return "Unknown"
-    if re.match(r"^[A-Z]\.$", tokens[0]): return "Unknown"  # ambiguous abbreviations
-    for t in tokens:
+    tok = s.split()
+    if not tok: return "Unknown"
+    if re.match(r"^[A-Z]\.$", tok[0]):  # reject "T."
+        return "Unknown"
+    for t in tok:
         if re.match(r"^[A-Z][a-z]+$", t):
             return t
     return "Unknown"
 
-def build_weights(csv_path: str, out_csv: str, min_evidence: int = 3):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(csv_path)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True, help="SalivaDB export CSV")
+    ap.add_argument("--out_csv", default="salivadb_genus_weights.csv")
+    ap.add_argument("--min_evidence", type=int, default=3)
+    args = ap.parse_args()
 
-    df = pd.read_csv(csv_path)
-    required = {"Biomarker Name", "Regulation"}
-    if not required.issubset(df.columns):
-        raise ValueError(f"CSV missing columns: {required}")
+    if not os.path.exists(args.csv):
+        raise FileNotFoundError(args.csv)
 
-    x = df[["Biomarker Name","Regulation"]].dropna()
-    x = x[x["Regulation"].isin(["Upregulated","Downregulated"])].copy()
-    x["Genus"] = x["Biomarker Name"].apply(clean_genus)
+    df = pd.read_csv(args.csv)
+    if not REQ_COLS.issubset(df.columns):
+        raise ValueError(f"CSV missing columns: {REQ_COLS}")
 
-    counts = x.groupby(["Genus","Regulation"]).size().unstack(fill_value=0)
+    df = df[["Biomarker Name","Regulation"]].dropna()
+    df = df[df["Regulation"].isin(["Upregulated","Downregulated"])]
+    df["Genus"] = df["Biomarker Name"].apply(clean_genus)
+
+    counts = df.groupby(["Genus","Regulation"]).size().unstack(fill_value=0)
     if "Upregulated" not in counts: counts["Upregulated"] = 0
     if "Downregulated" not in counts: counts["Downregulated"] = 0
-    counts.rename(columns={"Upregulated":"N_disease","Downregulated":"N_healthy"}, inplace=True)
+    counts = counts.rename(columns={"Upregulated":"N_disease","Downregulated":"N_healthy"})
 
     counts = counts[~counts.index.isin(EXCLUDE_TAXA)]
     counts = counts[~counts.index.str.match(r"^[A-Z]$")]
 
     total = counts["N_healthy"] + counts["N_disease"]
-    confident = counts[total >= min_evidence].copy()
-    if confident.empty:
-        raise RuntimeError("No genera meet evidence threshold")
+    counts = counts[total >= args.min_evidence].copy()
+    if counts.empty:
+        raise RuntimeError("No genera met the evidence threshold.")
 
-    confident["HealthWeight"] = ((confident["N_healthy"] - confident["N_disease"]) /
-                                 (confident["N_healthy"] + confident["N_disease"])).fillna(0.0)
+    counts["HealthWeight"] = (
+        (counts["N_healthy"] - counts["N_disease"]) / (counts["N_healthy"] + counts["N_disease"])
+    ).fillna(0.0)
 
-    confident[["HealthWeight"]].to_csv(out_csv)
+    out = counts[["HealthWeight"]].sort_values("HealthWeight", ascending=False)
+    out.to_csv(args.out_csv)
+
     meta = {
-        "source_csv": os.path.basename(csv_path),
+        "source_csv": os.path.abspath(args.csv),
         "generated_at": datetime.now().isoformat(),
-        "min_evidence": min_evidence,
-        "n_genera": int(len(confident)),
+        "min_evidence": args.min_evidence,
+        "n_genera": int(out.shape[0]),
+        "columns": list(out.columns)
     }
-    with open(out_csv.replace(".csv",".meta.json"), "w") as f:
+    with open(args.out_csv.replace(".csv",".meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"✅ wrote {out_csv} (+ .meta.json) with {len(confident)} genera")
+    print(f"✅ wrote {args.out_csv} and {args.out_csv.replace('.csv','.meta.json')} (n={out.shape[0]})")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True, help="SalivaDB CSV")
-    ap.add_argument("--out", default="salivadb_genus_weights.csv")
-    ap.add_argument("--min_evidence", type=int, default=3)
-    args = ap.parse_args()
-    build_weights(args.csv, args.out, args.min_evidence)
+    main()
