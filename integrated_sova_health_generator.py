@@ -1,103 +1,106 @@
 #!/usr/bin/env python3
 """
-integrated_sova_health_generator.py
-Generates a compact PDF for a single sample using batch scorer logic inline.
-Keeps dependencies light (ReportLab + Matplotlib).
+integrated_sova_health_generator.py  (lean PDF from scorer JSON)
+
+Reads patient_reports/<sample>_report_data.json and produces a compact PDF:
+  professional_reports/<sample>_Comprehensive_Report.pdf
+
+Content:
+- Title & summary (CHI, category)
+- Key metrics table
+- Disease risks table (if any)
+- Decision trace (why this classification)
+- Top genera bar chart (from raw_abundances)
+
+Dependencies: matplotlib only (PdfPages). No ReportLab required.
 """
-import os, json, argparse, pandas as pd, numpy as np, matplotlib.pyplot as plt
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.platypus import BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Image, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
+import argparse, os, json
+from datetime import datetime
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 
-from batch_health_scorer import load_feature_table_to_genus_abund, analyze_sample
+def generate_pdf(sample_id: str,
+                 reports_dir: str = "patient_reports",
+                 out_dir: str = "professional_reports") -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    in_path = os.path.join(reports_dir, f"{sample_id}_report_data.json")
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(in_path)
 
-def plot_top(abund: dict, out_path: str, topn: int = 15):
-    top = dict(sorted(abund.items(), key=lambda x: x[1], reverse=True)[:topn])
-    plt.figure(figsize=(8,5))
-    plt.barh(list(top.keys())[::-1], list(top.values())[::-1])
-    plt.xlabel("Relative abundance")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180, bbox_inches="tight"); plt.close()
+    data = json.load(open(in_path))
+    out_pdf = os.path.join(out_dir, f"{sample_id}_Comprehensive_Report.pdf")
 
-def build_pdf(sample_id: str, analysis: dict, out_pdf: str, top_img: str):
-    doc = BaseDocTemplate(out_pdf, pagesize=A4,
-                          leftMargin=18*mm,rightMargin=18*mm,topMargin=18*mm,bottomMargin=18*mm)
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    doc.addPageTemplates([PageTemplate(id="main", frames=frame)])
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="H", parent=styles["Heading1"], textColor=colors.HexColor("#2E86AB")))
+    with PdfPages(out_pdf) as pdf:
+        # Page 1: summary
+        fig = plt.figure(figsize=(8.27, 11.69))
+        plt.axis("off")
+        y = 0.95
+        plt.text(0.5, y, "Saliva Microbiome — Comprehensive Report",
+                 ha="center", va="top", fontsize=18, fontweight="bold")
+        y -= 0.04
+        plt.text(0.5, y, f"Sample: {sample_id} | Date: {datetime.now().strftime('%b %d, %Y')}",
+                 ha="center", va="top", fontsize=11)
+        y -= 0.06
 
-    story = []
-    story.append(Paragraph("MEDNOVA DIAGNOSTICS", styles["H"]))
-    story.append(Paragraph("Saliva Microbiome Health Summary", styles["Heading2"]))
-    story.append(Spacer(1, 6*mm))
+        chi = data.get("clinical_health_index", 0)
+        cat = data.get("health_category", {}).get("label","Unknown")
+        plt.text(0.08, y, f"Clinical Health Index (CHI): {chi:.2f}", fontsize=13, fontweight="bold"); y -= 0.03
+        plt.text(0.08, y, f"Category: {cat}", fontsize=12); y -= 0.03
 
-    a = analysis
-    rows = [
-        ["Sample", sample_id],
-        ["CHI", a["clinical_health_index"]],
-        ["Category", a["health_category"]["label"]],
-        ["Shannon", a["key_metrics"]["shannon_diversity"]],
-        ["B/P log-ratio", a["key_metrics"]["beneficial_pathogen_log_ratio"]],
-        ["SCFA abundance", a["key_metrics"]["scfa_producer_abundance"]],
-        ["Pathogen load", a["key_metrics"]["pathogen_load"]],
-    ]
-    tbl = Table(rows, colWidths=[45*mm, 100*mm])
-    tbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.3,colors.grey),
-                             ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9f2fb"))]))
-    story.append(tbl)
-    story.append(Spacer(1, 6*mm))
+        # Key metrics
+        km = data.get("key_metrics", {})
+        plt.text(0.08, y, "Key Metrics", fontsize=12.5, fontweight="bold"); y -= 0.026
+        for k in ["shannon_diversity","beneficial_pathogen_log_ratio","health_balance",
+                  "scfa_producer_abundance","pathogen_load","coverage_lod"]:
+            if k in km:
+                plt.text(0.10, y, f"• {k.replace('_',' ').title()}: {km[k]}", fontsize=10.5); y -= 0.018
 
-    story.append(Paragraph("Top Genera", styles["Heading2"]))
-    story.append(Image(top_img, width=160*mm, height=90*mm))
+        # Risks
+        risks = data.get("disease_risks", {})
+        y -= 0.018
+        plt.text(0.08, y, "Disease Risks", fontsize=12.5, fontweight="bold"); y -= 0.026
+        if risks:
+            for name, info in risks.items():
+                level = info.get("level","")
+                marker = info.get("marker","")
+                plt.text(0.10, y, f"• {name}: {level} — {marker}", fontsize=10.5); y -= 0.018
+        else:
+            plt.text(0.10, y, "• None detected by current panels", fontsize=10.5); y -= 0.018
 
-    story.append(Spacer(1, 6*mm))
-    story.append(Paragraph("Disease Risk Panels", styles["Heading2"]))
-    if a["disease_risks"]:
-        rows = [["Panel","Level","Score","Threshold","Markers"]]
-        for k,v in a["disease_risks"].items():
-            rows.append([k, v["level"], v["panel_score"], v["threshold"], v["marker"]])
-        rtbl = Table(rows, colWidths=[55*mm,25*mm,20*mm,22*mm,45*mm])
-        rtbl.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.3,colors.grey),
-                                  ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#fdebd0"))]))
-        story.append(rtbl)
-    else:
-        story.append(Paragraph("No panels exceeded empirical thresholds.", styles["Normal"]))
+        # Decision trace
+        trace = data.get("decision_trace", [])
+        y -= 0.018
+        plt.text(0.08, y, "Decision Trace", fontsize=12.5, fontweight="bold"); y -= 0.026
+        if trace:
+            for t in trace:
+                plt.text(0.10, y, f"• {t}", fontsize=10.5); y -= 0.018
+        else:
+            plt.text(0.10, y, "• (no special rules fired)", fontsize=10.5); y -= 0.018
 
-    doc.build(story)
+        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+        # Page 2: Top genera bar chart
+        abund = data.get("raw_abundances", {})
+        if abund:
+            items = sorted(abund.items(), key=lambda kv: kv[1], reverse=True)[:12]
+            labels, values = zip(*items)
+            fig = plt.figure(figsize=(8.27, 11.69))
+            ax = fig.add_axes([0.12, 0.12, 0.76, 0.80])
+            ax.barh(labels[::-1], [v*100 for v in values[::-1]])
+            ax.set_xlabel("Relative abundance (%)")
+            ax.set_title("Top Genera")
+            pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
+
+    print(f"wrote {out_pdf}")
+    return out_pdf
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample_id", required=True)
-    ap.add_argument("--feature_tsv", default="feature-table.tsv")
-    ap.add_argument("--asv_map", default="asv_to_genus_map.json")
-    ap.add_argument("--weights_csv", default="salivadb_genus_weights.csv")
-    ap.add_argument("--ref_stats", default="reference_stats.json")
-    ap.add_argument("--genus_percentiles", default="genus_percentiles.json")
-    ap.add_argument("--reports_dir", default="professional_reports")
-    ap.add_argument("--plots_dir", default="analysis_plots")
+    ap.add_argument("--reports_dir", default="patient_reports")
+    ap.add_argument("--out_dir", default="professional_reports")
     args = ap.parse_args()
-
-    os.makedirs(args.reports_dir, exist_ok=True); os.makedirs(args.plots_dir, exist_ok=True)
-    asv_map = json.load(open(args.asv_map))
-    weights = pd.read_csv(args.weights_csv, index_col=0)
-    ref = json.load(open(args.ref_stats)); gp = json.load(open(args.genus_percentiles))
-
-    genus_abund = load_feature_table_to_genus_abund(args.feature_tsv, asv_map)
-
-    if args.sample_id not in genus_abund.columns:
-        raise SystemExit(f"Sample '{args.sample_id}' not found in feature table.")
-
-    analysis = analyze_sample(genus_abund[args.sample_id], ref, weights, gp)
-
-    top_path = os.path.join(args.plots_dir, f"{args.sample_id}_top.png")
-    plot_top(analysis["raw_abundances"], top_path)
-
-    out_pdf = os.path.join(args.reports_dir, f"{args.sample_id}_Comprehensive_Report.pdf")
-    build_pdf(args.sample_id, analysis, out_pdf, top_path)
-    print(f"✅ PDF → {out_pdf}")
+    generate_pdf(args.sample_id, args.reports_dir, args.out_dir)
 
 if __name__ == "__main__":
     main()
